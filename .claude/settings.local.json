@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip --version)",
+      "Bash(pip install:*)",
+      "Bash(python manage.py migrate)",
+      "Bash(python manage.py runserver)",
+      "Bash(python manage.py runserver 8080)",
+      "Bash(ping -n 4 127.0.0.1)",
+      "Bash(curl:*)"
+    ]
+  }
+}
