@@ -1,4 +1,6 @@
 .env
+.claude/
+.vscode/
 *.pyc
 __pycache__/
 db.sqlite3
