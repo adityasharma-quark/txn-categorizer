@@ -1,6 +1,7 @@
 .env
 .claude/
 .vscode/
+*.drawio
 *.pyc
 __pycache__/
 db.sqlite3
