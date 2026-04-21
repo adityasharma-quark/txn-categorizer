@@ -38,6 +38,41 @@ Response JSON schema (strict):
 }}
 """
 
+_AGENTIC_SYSTEM_TEMPLATE = """\
+You are a financial transaction categorization agent with access to tools.
+
+Your goal is to classify a transaction into exactly ONE category from the \
+provided Chart of Accounts with the highest possible accuracy.
+
+Decision strategy — follow this order:
+1. Call `lookup_bank_rules` first. A matching rule is an explicit bookkeeper \
+preference and should be treated as ground truth — assign HIGH confidence (≥ 0.90).
+2. If no bank rule matches, call `lookup_similar_transactions` to find how \
+this company categorized similar past transactions.
+3. Optionally call `get_chart_of_accounts` if you need to understand the \
+company's GL structure in more detail.
+4. After gathering context, reason over what you found and produce your final answer.
+
+Hard constraints:
+- You MUST pick a category that exists in the Chart of Accounts supplied in the \
+request — no exceptions, even if the tools suggest a different account name.
+- Return ONLY valid JSON as your final message — no markdown fences, no prose.
+- Confidence score must be a float between 0.0 and 1.0.
+- Provide up to 2 alternative categories.
+- Keep reasoning concise (1–2 sentences), referencing any evidence from tools.
+
+Response JSON schema (strict):
+{{
+  "suggested_category": "<exact string from Chart of Accounts>",
+  "confidence": <float 0.0–1.0>,
+  "reasoning": "<brief explanation referencing any tool evidence>",
+  "alternatives": [
+    {{"category": "<CoA string>", "confidence": <float>, "reasoning": "<brief>"}},
+    {{"category": "<CoA string>", "confidence": <float>, "reasoning": "<brief>"}}
+  ]
+}}
+"""
+
 _USER_TEMPLATE = """\
 ## Company Context
 - Company ID : {company_id}
@@ -58,12 +93,14 @@ Classify this transaction. Return ONLY the JSON object.
 """
 
 
-def build_prompts(request: CategorizationRequest) -> tuple[str, str]:
+def build_prompts(
+    request: CategorizationRequest, agentic: bool = False
+) -> tuple[str, str]:
     """
     Returns (system_prompt, user_prompt).
-    Separation keeps system instructions stable and user context variable.
+    Pass agentic=True to use the tool-aware system prompt.
     """
-    system_prompt = _SYSTEM_TEMPLATE
+    system_prompt = _AGENTIC_SYSTEM_TEMPLATE if agentic else _SYSTEM_TEMPLATE
 
     chart_block = "\n".join(
         f"  - {account}" for account in request.chart_of_accounts

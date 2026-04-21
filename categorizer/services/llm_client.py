@@ -3,6 +3,10 @@ llm_client.py — Model-agnostic LLM abstraction layer.
 
 Adding a new provider: subclass BaseLLMClient, implement `complete()`,
 then register in LLMClientFactory.get().
+
+Agentic tool use is opt-in: providers override `supports_tools()` and
+`complete_agentic()`. Only AnthropicClient currently implements the full
+agentic loop with stop_reason == "end_turn" / "tool_use".
 """
 from __future__ import annotations
 
@@ -10,11 +14,13 @@ import json
 import logging
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Dict
+from typing import Any, Callable, Dict, List
 
 from django.conf import settings
 
 logger = logging.getLogger(__name__)
+
+_MAX_AGENTIC_ITERATIONS = 10
 
 
 # ──────────────────────────────────────────────
@@ -26,7 +32,7 @@ class BaseLLMClient(ABC):
 
     @abstractmethod
     def complete(self, system_prompt: str, user_prompt: str) -> str:
-        """Return a raw text completion."""
+        """Single-turn text completion — no tool use."""
 
     @property
     @abstractmethod
@@ -37,6 +43,27 @@ class BaseLLMClient(ABC):
     @abstractmethod
     def provider_name(self) -> str:
         """Provider identifier (openai / huggingface / anthropic)."""
+
+    def supports_tools(self) -> bool:
+        """Return True if this client implements complete_agentic()."""
+        return False
+
+    def complete_agentic(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        tools: List[Dict[str, Any]],
+        tool_executor: Callable[[str, Dict[str, Any]], str],
+    ) -> str:
+        """
+        Agentic multi-turn completion with tool use.
+        Default implementation ignores tools and falls back to complete().
+        Providers that support tool use must override this method.
+        """
+        return self.complete(system_prompt, user_prompt)
+
+    # Populated by complete_agentic() implementations; read by the service layer.
+    last_tools_used: List[str] = []
 
 
 # ──────────────────────────────────────────────
@@ -104,6 +131,7 @@ class AnthropicClient(BaseLLMClient):
 
         self._client = anthropic.Anthropic(api_key=settings.LLM_API_KEY)
         self._model = settings.LLM_MODEL or "claude-haiku-4-5-20251001"
+        self.last_tools_used: List[str] = []
 
     @property
     def model_name(self) -> str:
@@ -113,7 +141,11 @@ class AnthropicClient(BaseLLMClient):
     def provider_name(self) -> str:
         return "anthropic"
 
+    def supports_tools(self) -> bool:
+        return True
+
     def complete(self, system_prompt: str, user_prompt: str) -> str:
+        """Single-turn completion — no tools. Used as fallback."""
         logger.debug("LLM request | provider=anthropic model=%s", self._model)
         message = self._client.messages.create(
             model=self._model,
@@ -124,6 +156,95 @@ class AnthropicClient(BaseLLMClient):
         text = message.content[0].text if message.content else ""
         logger.debug("LLM response received | length=%d", len(text))
         return text
+
+    def complete_agentic(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        tools: List[Dict[str, Any]],
+        tool_executor: Callable[[str, Dict[str, Any]], str],
+    ) -> str:
+        """
+        Agentic loop: the model can call tools repeatedly until it returns
+        stop_reason == "end_turn", at which point we return its final text.
+
+        Loop invariant:
+          - stop_reason == "tool_use"  → execute tools, append results, continue
+          - stop_reason == "end_turn"  → extract text content, return
+          - anything else              → treat as terminal, return whatever text exists
+        """
+        self.last_tools_used = []
+        messages: List[Dict[str, Any]] = [{"role": "user", "content": user_prompt}]
+
+        logger.debug(
+            "Agentic request | provider=anthropic model=%s tools=%d",
+            self._model,
+            len(tools),
+        )
+
+        for iteration in range(_MAX_AGENTIC_ITERATIONS):
+            response = self._client.messages.create(
+                model=self._model,
+                max_tokens=settings.LLM_MAX_TOKENS,
+                system=system_prompt,
+                tools=tools,
+                messages=messages,
+            )
+
+            logger.debug(
+                "Agentic iteration %d | stop_reason=%s",
+                iteration + 1,
+                response.stop_reason,
+            )
+
+            if response.stop_reason == "end_turn":
+                text = next(
+                    (b.text for b in response.content if hasattr(b, "text")), ""
+                )
+                logger.debug(
+                    "Agentic loop complete | iterations=%d tools_used=%s",
+                    iteration + 1,
+                    self.last_tools_used,
+                )
+                return text
+
+            if response.stop_reason == "tool_use":
+                # Append assistant's turn (including tool_use blocks)
+                messages.append({"role": "assistant", "content": response.content})
+
+                # Execute every tool the model requested
+                tool_results = []
+                for block in response.content:
+                    if block.type == "tool_use":
+                        self.last_tools_used.append(block.name)
+                        result = tool_executor(block.name, block.input)
+                        tool_results.append(
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": result,
+                            }
+                        )
+
+                # Feed results back as a user turn
+                messages.append({"role": "user", "content": tool_results})
+
+            else:
+                # Unexpected stop reason (e.g. max_tokens) — return what we have
+                logger.warning(
+                    "Unexpected stop_reason '%s' at iteration %d",
+                    response.stop_reason,
+                    iteration + 1,
+                )
+                return next(
+                    (b.text for b in response.content if hasattr(b, "text")), ""
+                )
+
+        logger.warning(
+            "Agentic loop hit max iterations (%d); returning last text content",
+            _MAX_AGENTIC_ITERATIONS,
+        )
+        return next((b.text for b in response.content if hasattr(b, "text")), "")
 
 
 # ──────────────────────────────────────────────

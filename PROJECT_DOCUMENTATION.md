@@ -49,14 +49,26 @@ txn_categorizer/
 │   │
 │   ├── services/                     # Business logic layer
 │   │   ├── __init__.py
-│   │   ├── categorization_service.py # Orchestrator — pipeline entry point
-│   │   ├── context_builder.py        # Prompt construction
-│   │   ├── llm_client.py             # Model-agnostic LLM abstraction + factory
-│   │   └── response_formatter.py     # JSON parsing & validation
+│   │   ├── categorization_service.py # Orchestrator — agentic or standard pipeline
+│   │   ├── context_builder.py        # Prompt construction (standard + agentic variants)
+│   │   ├── llm_client.py             # LLM abstraction + agentic loop (AnthropicClient)
+│   │   ├── response_formatter.py     # JSON parsing & validation
+│   │   └── tools.py                  # Tool definitions + implementations (NEW)
 │   │
 │   └── utils/                        # Utility functions
 │       ├── __init__.py
 │       └── exception_handler.py      # Global DRF exception handler
+│
+├── heuristics/                       # Company-specific reference data (not in repo)
+│   ├── c125_BankRules.json           # Keyword → GL account rules (company 125)
+│   ├── c125_COA.json                 # Chart of Accounts (company 125, 280 accounts)
+│   ├── c125_Categorized_Transactions_07-01-24_06-30-25.json  # 1,243 historical txns
+│   ├── c125_Plaid_Transactions_07-01-25_12-18-25.json        # Raw Plaid bank feed
+│   ├── c417_BankRules.json           # Same set for company 417
+│   ├── c417_COA.json
+│   ├── c417_Categorized_Transactions_07-01-24_06-30-25.json
+│   ├── c417_Plaid_Transactions(01)_07-01-25_12-18-25.json
+│   └── c417_Plaid_Transactions(02)_07-01-25_12-18-25.json
 │
 ├── sample_data/                      # Test fixtures & mock data
 │   ├── __init__.py
@@ -71,219 +83,186 @@ txn_categorizer/
 
 ## 2. Architectural Layers
 
-The project follows a clean, layered Django REST Framework architecture with strict separation of concerns.
-
 ### Layer 1 — HTTP / Routing
 - **Files**: `core/urls.py`, `categorizer/urls.py`
-- **Purpose**: Maps incoming HTTP requests to the appropriate view class.
 - Root URL (`core/urls.py`) forwards all `/api/v1/` traffic to `categorizer/urls.py`.
 
 ### Layer 2 — Views (Thin Controllers)
 - **File**: `categorizer/views.py`
-- **Classes**:
-  - `CategorizeTransactionView` — handles `POST /api/v1/categorize/`
-  - `HealthCheckView` — handles `GET /api/v1/health/`
-  - `SampleDataView` — handles `GET /api/v1/samples/`
-- **Purpose**: Validate the incoming request (via Pydantic), delegate to the service layer, and return the HTTP response. Contains **no business logic**.
+- **Classes**: `CategorizeTransactionView`, `HealthCheckView`, `SampleDataView`
+- Validate incoming request via Pydantic, delegate to service layer, return HTTP response. No business logic.
 
 ### Layer 3 — Validation (Pydantic Schemas)
 - **File**: `categorizer/schemas.py`
-- **Classes**:
 
 | Class | Purpose |
 |---|---|
-| `Transaction` | A single transaction descriptor (description, payee, amount, currency, date) |
-| `HistoricalTransaction` | A labeled past transaction used for few-shot prompting |
+| `Transaction` | A single transaction descriptor |
+| `HistoricalTransaction` | A labeled past transaction for few-shot prompting |
 | `CategorizationRequest` | Inbound API request body — auto-caps history at 20 records |
 | `CategorySuggestion` | An alternative category with confidence score and reasoning |
-| `CategorizationResponse` | Complete outbound response with confidence label |
+| `CategorizationResponse` | Complete outbound response including `tools_used` list |
 | `ErrorResponse` | Consistent error envelope |
 
-**Confidence thresholds** (defined here):
-- `HIGH` — score ≥ 0.80
-- `MEDIUM` — score ≥ 0.50
-- `LOW` — score < 0.50
+**Confidence thresholds**: HIGH ≥ 0.80, MEDIUM ≥ 0.50, LOW < 0.50
 
 ### Layer 4 — Services (Business Logic)
 
-The service layer implements a 3-step pipeline:
-
 #### `categorization_service.py` (Orchestrator)
 - Function: `categorize_transaction(request) → CategorizationResponse`
-- Calls the three steps below in sequence.
+- Checks `client.supports_tools()` to select the agentic or standard pipeline.
+- **Agentic path**: builds agentic prompt → calls `complete_agentic()` → tools loop runs → parse output
+- **Standard path**: builds standard prompt → calls `complete()` → parse output
 
-#### `context_builder.py` (Step 1 — Prompt Construction)
-- Function: `build_prompts(request) → (system_prompt, user_prompt)`
-- Embeds the Chart of Accounts as a constrained label set.
-- Formats historical transactions as few-shot examples.
-- The system prompt is static; the user prompt is variable.
+#### `context_builder.py` (Prompt Construction)
+- Function: `build_prompts(request, agentic=False) → (system_prompt, user_prompt)`
+- `agentic=True` returns `_AGENTIC_SYSTEM_TEMPLATE` which instructs the model to use tools before deciding.
+- `agentic=False` returns the original `_SYSTEM_TEMPLATE` for single-turn classification.
 
-#### `llm_client.py` (Step 2 — LLM Abstraction)
-- `BaseLLMClient` — abstract base with interface: `complete(system, user) → str`
+#### `llm_client.py` (LLM Abstraction)
+- `BaseLLMClient` — abstract base with `complete()`, `supports_tools()`, and `complete_agentic()`
 - **Implementations**:
-  - `OpenAIClient` — Native OpenAI SDK; supports custom `base_url` for self-hosted endpoints (HuggingFace TGI, vLLM, etc.)
-  - `HuggingFaceClient` — Extends `OpenAIClient` using HF's OpenAI-compatible API
-  - `AnthropicClient` — Native Anthropic SDK
-- `LLMClientFactory` — resolves and instantiates the correct client based on `LLM_PROVIDER` setting
-- `extract_json_block()` — helper to parse JSON from raw LLM text (handles markdown fences, prose wrapping)
+  - `OpenAIClient` — single-turn; `supports_tools()` returns False
+  - `HuggingFaceClient` — extends `OpenAIClient` for HF-compatible endpoints
+  - `AnthropicClient` — implements the full agentic loop; `supports_tools()` returns True
+- `LLMClientFactory` — resolves and instantiates the correct client from `LLM_PROVIDER`
 
-#### `response_formatter.py` (Step 3 — Parse & Validate)
-- Function: `parse_and_format(raw_response, request, client) → CategorizationResponse`
-- Extracts JSON from raw LLM text.
-- Validates the suggested category exists in the Chart of Accounts (case-insensitive).
-- Fuzzy fallback matching by word-overlap for minor wording differences.
-- Clamps confidence scores to `[0.0, 1.0]`.
-- Parses and deduplicates alternative categories.
+**`AnthropicClient.complete_agentic()` loop logic:**
+```
+messages = [user_prompt]
+for iteration in range(10):          # max 10 iterations
+    response = messages.create(...)
+    if stop_reason == "end_turn":    # ← model is done
+        return text content
+    if stop_reason == "tool_use":    # ← model wants tool results
+        execute tools → append results → continue
+    else:
+        return text content          # unexpected stop, exit gracefully
+```
+
+#### `tools.py` (Tool Definitions + Implementations) — NEW
+- **Tool definitions** (Anthropic API format) in `TOOL_DEFINITIONS`
+- **Tool implementations**:
+
+| Function | File(s) read | Purpose |
+|---|---|---|
+| `lookup_bank_rules(company_id, description)` | `c{id}_BankRules.json` | Keyword-match active rules; resolves account IDs to names via COA |
+| `lookup_similar_transactions(company_id, description, payee)` | `c{id}_Categorized_Transactions*.json` | Word-overlap search; returns up to 5 past transactions with their categories |
+| `get_chart_of_accounts(company_id)` | `c{id}_COA.json` | Full GL account list grouped by ASSETS / LIABILITIES / EQUITY / INCOME / EXPENSES / COGS |
+| `execute_tool(name, inputs)` | — | Dispatcher; called by the agentic loop |
+
+- **File caching**: `_file_cache` dict at module level — each heuristics file is loaded once per process.
+- **Company ID normalization**: `_normalize_cid()` handles `"125"`, `"c125"`, `"C125"` → `"125"`.
+
+#### `response_formatter.py` (Parse & Validate)
+- Function: `parse_and_format(raw_response, request, client, tools_used=None) → CategorizationResponse`
+- Extracts JSON, validates category (exact + fuzzy), clamps confidence, deduplicates alternatives.
+- Passes `tools_used` into the response object.
 
 ### Layer 5 — Utilities
-- **File**: `categorizer/utils/exception_handler.py`
-- Global DRF exception handler (`custom_exception_handler`)
-- Returns a consistent error envelope: `{"error": ..., "detail": ..., "code": ...}`
+- `categorizer/utils/exception_handler.py` — global DRF exception handler
+- Returns `{"error": ..., "detail": ..., "code": ...}` for all errors
 
 ### Layer 6 — Configuration
-- **File**: `core/settings.py`
-- All LLM settings and Django settings loaded from `.env` via `python-dotenv`.
-- No hardcoded provider or model logic.
+- `core/settings.py` — all LLM settings loaded from `.env` via `python-dotenv`
 
 ---
 
 ## 3. API Endpoints
 
-All endpoints are prefixed with `/api/v1/`.
-
 | Method | Route | Purpose |
 |---|---|---|
-| `POST` | `/api/v1/categorize/` | Categorize a single transaction using an LLM |
+| `POST` | `/api/v1/categorize/` | Categorize a transaction (agentic or standard) |
 | `GET` | `/api/v1/health/` | Liveness probe |
-| `GET` | `/api/v1/samples/` | Return 5 mock sample requests for testing |
-
----
+| `GET` | `/api/v1/samples/` | Return 5 mock sample requests |
 
 ### POST `/api/v1/categorize/`
 
-Categorizes a single financial transaction into a company-specific Chart of Accounts using an LLM.
-
-**Request Body** (`application/json`):
+**Request Body:**
 ```json
 {
   "transaction": {
     "description": "string (required, 1–500 chars)",
-    "payee": "string (optional, max 200 chars)",
+    "payee": "string (optional)",
     "amount": "float (optional)",
-    "currency": "string (optional, max 3 chars, e.g. 'USD')",
-    "date": "ISO-8601 string (optional, for context only)"
+    "currency": "string (optional, max 3 chars)",
+    "date": "ISO-8601 string (optional)"
   },
-  "company_id": "string (required, 1–100 chars)",
-  "industry": "string (required, 1–100 chars)",
-  "chart_of_accounts": ["string", "..."] (required, min 1 item),
-  "historical_transactions": [
-    {
-      "description": "string (required)",
-      "payee": "string (optional)",
-      "amount": "float (optional)",
-      "category": "string (required, must be from CoA)"
-    }
-  ] (optional, capped at 20 records)
+  "company_id": "string (required)",
+  "industry": "string (required)",
+  "chart_of_accounts": ["string", "..."],
+  "historical_transactions": [{"description": "...", "category": "..."}]
 }
 ```
 
-**Response — HTTP 200**:
+**Response — HTTP 200:**
 ```json
 {
   "transaction_description": "string",
   "payee": "string or null",
   "suggested_category": "string (exact match from CoA)",
-  "confidence_score": "float [0.0–1.0]",
-  "confidence_label": "HIGH | MEDIUM | LOW",
-  "alternative_categories": [
-    {
-      "category": "string (from CoA)",
-      "confidence": "float [0.0–1.0]",
-      "reasoning": "string"
-    }
-  ],
-  "reasoning": "string (1–2 sentences)",
-  "model_used": "string (e.g. 'gpt-4o-mini')",
-  "provider": "string (e.g. 'openai')"
+  "confidence_score": 0.92,
+  "confidence_label": "HIGH",
+  "alternative_categories": [...],
+  "reasoning": "string",
+  "model_used": "claude-haiku-4-5-20251001",
+  "provider": "anthropic",
+  "tools_used": ["lookup_bank_rules", "lookup_similar_transactions"]
 }
 ```
 
-**Error Responses**:
+**Error Responses:**
 
-| HTTP Status | Trigger | Error Body |
-|---|---|---|
-| `422` | Pydantic validation failure | `{error, detail (list), code: null}` |
-| `400` | Malformed JSON body | `{error, detail (string), code: null}` |
-| `502` | LLM API call failure | `{error, detail, code: null}` |
-| `500` | Unhandled server error | `{error, detail, code: "internal_error"}` |
-
----
-
-### GET `/api/v1/health/`
-
-Returns `{"status": "ok"}` with HTTP 200. Used as a liveness/readiness probe.
-
----
-
-### GET `/api/v1/samples/`
-
-Returns 5 pre-built sample `CategorizationRequest` objects (from `sample_data/mock_data.py`) as `{"samples": [...]}`. Useful for manual testing and integration demos.
+| HTTP Status | Trigger |
+|---|---|
+| `422` | Pydantic validation failure |
+| `400` | Malformed JSON body |
+| `502` | LLM API call failure |
+| `500` | Unhandled server error |
 
 ---
 
 ## 4. Configuration & Environment Variables
 
-**Files**: `.env` (runtime, not in repo), `.env.example` (template), `core/settings.py` (loads from `.env`)
-
-| Variable | Default | Example Values | Purpose |
-|---|---|---|---|
-| `LLM_PROVIDER` | `openai` | `openai` \| `huggingface` \| `anthropic` | Which LLM backend to use |
-| `LLM_API_KEY` | — (required) | `sk-...` / `hf_...` / `sk-ant-...` | API authentication token |
-| `LLM_MODEL` | `gpt-4o-mini` | `gpt-4`, `claude-3-5-sonnet-latest`, etc. | Model identifier |
-| `LLM_BASE_URL` | — (optional) | HF TGI endpoint, vLLM endpoint | Custom OpenAI-compatible endpoint |
-| `LLM_TEMPERATURE` | `0.1` | `0.0`–`2.0` | Determinism (lower = more deterministic) |
-| `LLM_MAX_TOKENS` | `512` | `1024`, etc. | Max tokens in LLM response |
-| `DEBUG` | `True` | `True` \| `False` | Django debug mode |
-| `DJANGO_SECRET_KEY` | `dev-secret-key-change-in-prod` | Long random string | Django CSRF/session secret |
-| `ALLOWED_HOSTS` | `*` | Comma-separated hostnames | Allowed request hosts |
+| Variable | Default | Purpose |
+|---|---|---|
+| `LLM_PROVIDER` | `openai` | `openai` \| `huggingface` \| `anthropic` |
+| `LLM_API_KEY` | — (required) | API authentication token |
+| `LLM_MODEL` | `gpt-4o-mini` | Model identifier |
+| `LLM_BASE_URL` | — (optional) | Custom OpenAI-compatible endpoint |
+| `LLM_TEMPERATURE` | `0.1` | Determinism |
+| `LLM_MAX_TOKENS` | `512` | Max tokens per LLM response |
+| `DEBUG` | `True` | Django debug mode |
+| `DJANGO_SECRET_KEY` | dev key | Django CSRF/session secret |
+| `ALLOWED_HOSTS` | `*` | Allowed request hosts |
 
 ---
 
 ## 5. Tech Stack & Dependencies
 
-**File**: `requirements.txt`
-
-| Package | Version | Purpose |
-|---|---|---|
-| `django` | `>=4.2,<5.0` | Web framework |
-| `djangorestframework` | `>=3.14` | REST API framework |
-| `openai` | `>=1.30` | OpenAI API client (required by default) |
-| `pydantic` | `>=2.0` | Schema validation & type coercion |
-| `python-dotenv` | `>=1.0` | Load `.env` into environment |
-| `anthropic` | `>=0.25` (optional) | Anthropic API client |
-| `pytest` | `>=8.0` (optional) | Test framework |
-| `pytest-django` | `>=4.8` (optional) | Django-pytest integration |
-
-**Summary**:
-- **Language**: Python 3.10+
-- **Web Framework**: Django REST Framework
-- **LLM Backends**: OpenAI (default), Anthropic, HuggingFace (OpenAI-compatible)
-- **Validation**: Pydantic v2+
-- **Database**: SQLite (no ORM models — database barely used)
-- **Config**: Environment variables via `python-dotenv`
+| Package | Purpose |
+|---|---|
+| `django >=4.2,<5.0` | Web framework |
+| `djangorestframework >=3.14` | REST API framework |
+| `openai >=1.30` | OpenAI API client |
+| `pydantic >=2.0` | Schema validation & type coercion |
+| `python-dotenv >=1.0` | Load `.env` into environment |
+| `anthropic >=0.25` (optional) | Anthropic API client — required for agentic tool use |
+| `pytest >=8.0` (optional) | Test framework |
+| `pytest-django >=4.8` (optional) | Django-pytest integration |
 
 ---
 
 ## 6. Entry Points
 
-| Entry Point | Type | Command |
-|---|---|---|
-| `manage.py` | Development server | `python manage.py runserver` |
-| `manage.py` | Database migrations | `python manage.py migrate` |
-| `manage.py` | Test runner | `python manage.py test tests` |
-| `core/wsgi.py` | Production (sync) | `gunicorn core.wsgi:application --bind 0.0.0.0:8000` |
-| `core/asgi.py` | Production (async) | `uvicorn core.asgi:application --host 0.0.0.0 --port 8000` |
-| `evaluate.py` | Evaluation script | `python evaluate.py` |
+| Entry Point | Command |
+|---|---|
+| Development server | `python manage.py runserver` |
+| Database migrations | `python manage.py migrate` |
+| Test runner | `python manage.py test tests` |
+| Production (sync) | `gunicorn core.wsgi:application --bind 0.0.0.0:8000` |
+| Production (async) | `uvicorn core.asgi:application --host 0.0.0.0 --port 8000` |
+| Evaluation script | `python evaluate.py` |
 
 ---
 
@@ -291,88 +270,71 @@ Returns 5 pre-built sample `CategorizationRequest` objects (from `sample_data/mo
 
 ### Test Suite (`tests/test_categorization.py`)
 
-| Test Class | # Tests | Coverage |
-|---|---|---|
-| `TestSchemaValidation` | 4 | Pydantic validation, history capping (max 20), confidence label thresholds |
-| `TestContextBuilder` | 6 | Prompt building, CoA embedding, few-shot history formatting, no-history handling |
-| `TestExtractJsonBlock` | 4 | JSON extraction from plain / fenced / prose-wrapped LLM output |
-| `TestResponseFormatter` | 7 | JSON parsing, category validation, confidence clamping, case-insensitive matching |
-| `TestCategorizationServiceIntegration` | 2 | End-to-end pipeline (mocked LLM), LLM failure handling |
+| Test Class | Coverage |
+|---|---|
+| `TestSchemaValidation` | Pydantic validation, history capping, confidence labels |
+| `TestContextBuilder` | Prompt building, CoA embedding, few-shot formatting |
+| `TestExtractJsonBlock` | JSON extraction from fenced / prose-wrapped LLM output |
+| `TestResponseFormatter` | JSON parsing, category validation, confidence clamping |
+| `TestCategorizationServiceIntegration` | End-to-end pipeline (LLM mocked), failure handling |
 
-```bash
-# Run with Django test runner
-python manage.py test tests
-
-# Run with pytest
-pytest tests/ -v
-```
-
-### Middleware (configured in `core/settings.py`)
-
+### Middleware (`core/settings.py`)
 - `SecurityMiddleware` — HTTPS/security headers
-- `CommonMiddleware` — CORS, ETag, etc.
-
-### Global Exception Handler (`categorizer/utils/exception_handler.py`)
-
-Wraps all DRF exceptions in a consistent envelope:
-```json
-{
-  "error": "Human-readable message",
-  "detail": "Specific detail or list of validation errors",
-  "code": "machine-readable code or null"
-}
-```
+- `CommonMiddleware` — CORS, ETag
 
 ### Utility Functions
 
 | File | Function | Purpose |
 |---|---|---|
-| `llm_client.py` | `extract_json_block(raw)` | Parse JSON from LLM response (handles fences, prose) |
+| `llm_client.py` | `extract_json_block(raw)` | Parse JSON from LLM text (fences, prose) |
 | `response_formatter.py` | `_validate_category()` | Case-insensitive CoA matching + fuzzy fallback |
-| `response_formatter.py` | `_fuzzy_match()` | Word-overlap matching for minor wording differences |
-| `response_formatter.py` | `_clamp()` | Clamp confidence scores to `[0.0, 1.0]` |
-| `response_formatter.py` | `_parse_alternatives()` | Parse & deduplicate alternative categories |
+| `response_formatter.py` | `_fuzzy_match()` | Word-overlap matching |
+| `response_formatter.py` | `_clamp()` | Clamp confidence to `[0.0, 1.0]` |
+| `tools.py` | `_build_account_map()` | Build account-id → name dict from COA file |
+| `tools.py` | `_normalize_cid()` | Normalize company ID format |
 
 ---
 
 ## 8. Design Patterns & Key Decisions
 
-### 1. LLM Abstraction Layer (`BaseLLMClient`)
-The interface is minimal: `complete(system, user) → str`. Adding a new LLM provider only requires subclassing `BaseLLMClient` and registering it in `LLMClientFactory`. No changes to the service or view layer.
+### 1. True Agentic Loop (NEW)
+`AnthropicClient` implements a real agentic loop. The model decides which tools to call, in what order, based on the transaction and company context. The loop exits only when `stop_reason == "end_turn"`. This is not a pre-scripted flow — the model's tool-calling behavior is emergent.
 
-### 2. Pydantic for All I/O
-All validation lives in `schemas.py`. Views stay thin. Pydantic handles type coercion, field limits, and history capping (max 20 records) automatically.
+### 2. Graceful Degradation
+`BaseLLMClient.supports_tools()` defaults to `False`. Non-Anthropic providers get the original single-turn pipeline transparently. The categorization service branches on this flag — no other code changes needed when switching providers.
 
-### 3. Prompt Separation
-- **System prompt** — static instructions + required JSON output schema
-- **User prompt** — variable per-request (company context, CoA, history, transaction)
+### 3. Heuristics as Ground Truth
+The `lookup_bank_rules` tool encodes an explicit signal: if a rule matches, it represents a human bookkeeper's deliberate choice and should be treated as high-confidence ground truth. The agentic system prompt instructs the model to respect this.
 
-This makes prompt iteration easy without touching business logic.
+### 4. Tool File Caching
+`_file_cache` in `tools.py` is a module-level dict. Each heuristics file is read from disk once per process. Avoids re-reading large files (e.g. 1,243-transaction history) on every request.
 
-### 4. Category Validation with Fuzzy Fallback
-The formatter enforces that the LLM's suggested category exists in the Chart of Accounts:
+### 5. `tools_used` Observability
+Every API response includes `tools_used`, a deduplicated list of tools the agent called. This enables debugging, latency attribution, and confidence analysis (e.g. HIGH confidence with `lookup_bank_rules` means a rule matched).
+
+### 6. Prompt Separation
+- `_SYSTEM_TEMPLATE` — original single-turn instructions
+- `_AGENTIC_SYSTEM_TEMPLATE` — tool-aware instructions with explicit decision strategy
+Both share the same JSON output schema. The `build_prompts(agentic=True/False)` flag selects the right template.
+
+### 7. Category Validation with Fuzzy Fallback
 1. Exact match (case-insensitive)
 2. Word-overlap fuzzy match
-3. Raises an error if neither matches
+3. Raises ValueError if neither matches
 
-This prevents silent category mismatches where the LLM hallucinates a category name.
+Prevents silent category mismatches where the LLM or a tool returns a slightly different account name.
 
-### 5. Multi-Tenant by Design
-Company ID, industry, Chart of Accounts, and historical transactions are all runtime inputs. There is no hardcoded company logic anywhere in the codebase.
+### 8. Multi-Tenant by Design
+Company ID, industry, CoA, and history are all runtime inputs. Heuristics files are discovered by convention (`c{id}_BankRules.json`). No hardcoded company logic anywhere.
 
-### 6. PII-Safe Logging
-The application logs model, provider, category, and confidence scores — but **never** logs transaction descriptions or payee names.
-
-### 7. Consistent Error Envelopes
-All errors follow `{error, detail, code}`. HTTP status codes follow REST conventions (422 = validation, 502 = upstream service, 500 = server error).
+### 9. PII-Safe Logging
+Logs model, provider, category, confidence, and tool names — never transaction descriptions or payee names.
 
 ---
 
 ## 9. Sample Data & Evaluation
 
 ### Mock Samples (`sample_data/mock_data.py`)
-
-5 pre-built test cases with expected results:
 
 | # | Transaction | Expected Category | Min Confidence |
 |---|---|---|---|
@@ -383,26 +345,22 @@ All errors follow `{error, detail, code}`. HTTP status codes follow REST convent
 | 5 | Staples printer ink | Office Supplies | 0.75 |
 
 ### Default Chart of Accounts (10 categories)
-- Software & Subscriptions
-- Office Supplies
-- Travel & Lodging
-- Meals & Entertainment
-- Advertising & Marketing
-- Professional Services
-- Utilities
-- Payroll & Benefits
-- Equipment & Hardware
-- Miscellaneous
+Software & Subscriptions, Office Supplies, Travel & Lodging, Meals & Entertainment,
+Advertising & Marketing, Professional Services, Utilities, Payroll & Benefits,
+Equipment & Hardware, Miscellaneous
+
+### Heuristics Data (2 companies)
+
+| Company | Bank Rules | COA Accounts | Historical Transactions |
+|---|---|---|---|
+| c125 | ~10 rules | 280 accounts | 1,243 categorized |
+| c417 | ~35 rules | — | — |
 
 ### Evaluation Script (`evaluate.py`)
-- Runs all 5 samples through the **live** LLM (requires `.env` configured)
-- Reports: top-1 accuracy, confidence distribution (avg/min/max), per-sample results
-- Saves full results to `evaluation_results.json`
-- Exit code: `0` if accuracy ≥ 60%, `1` otherwise
-
-```bash
-python evaluate.py
-```
+- Runs all 5 samples through the live LLM (requires `.env` configured)
+- Reports: top-1 accuracy, confidence distribution, per-sample results
+- Saves results to `evaluation_results.json`
+- Exit code: `0` if accuracy ≥ 60%
 
 ---
 
@@ -419,33 +377,42 @@ POST /api/v1/categorize/  (JSON body)
          ▼
 [categorize_transaction(request)]  ← categorization_service.py
   │
-  ├─ Step 1: build_prompts(request)  ← context_builder.py
-  │           ├─ Static system_prompt (instructions + JSON schema)
-  │           └─ Variable user_prompt (company, CoA, history, transaction)
+  ├─ client = LLMClientFactory.get()
   │
-  ├─ Step 2: LLMClientFactory.get()  ← llm_client.py
-  │           ├─ Resolve provider from settings (openai / anthropic / huggingface)
-  │           └─ client.complete(system_prompt, user_prompt) → raw_text
+  ├─ IF client.supports_tools() == True (AnthropicClient):
+  │   ├─ build_prompts(request, agentic=True)
+  │   └─ client.complete_agentic(system, user, TOOL_DEFINITIONS, execute_tool)
+  │       │
+  │       ├─ [iteration 1] stop_reason="tool_use"
+  │       │   ├─ execute lookup_bank_rules(company_id, description)
+  │       │   └─ append tool result → continue
+  │       │
+  │       ├─ [iteration 2] stop_reason="tool_use"
+  │       │   ├─ execute lookup_similar_transactions(company_id, description)
+  │       │   └─ append tool result → continue
+  │       │
+  │       └─ [iteration 3] stop_reason="end_turn"  ← exit loop, return text
   │
-  └─ Step 3: parse_and_format(raw_text, request, client)  ← response_formatter.py
-             ├─ extract_json_block(raw_text)
-             ├─ _validate_category(cat, chart_of_accounts)
-             │   └─ Fuzzy fallback if not exact match
-             ├─ _clamp(confidence) → [0.0, 1.0]
-             ├─ _parse_alternatives(...)
-             └─ Return CategorizationResponse
+  └─ IF client.supports_tools() == False (OpenAI / HuggingFace):
+      ├─ build_prompts(request, agentic=False)
+      └─ client.complete(system, user) → raw_text
          │
          ▼
-HTTP 200 (JSON)
+[parse_and_format(raw_text, request, client, tools_used)]
+  ├─ extract_json_block(raw_text)
+  ├─ _validate_category(cat, chart_of_accounts)
+  │   └─ Fuzzy fallback if not exact match
+  ├─ _clamp(confidence) → [0.0, 1.0]
+  ├─ _parse_alternatives(...)
+  └─ Return CategorizationResponse(tools_used=[...])
+         │
+         ▼
+HTTP 200 JSON
 {
-  "transaction_description": "...",
-  "payee": "...",
   "suggested_category": "...",
-  "confidence_score": 0.92,
+  "confidence_score": 0.95,
   "confidence_label": "HIGH",
-  "alternative_categories": [...],
-  "reasoning": "...",
-  "model_used": "gpt-4o-mini",
-  "provider": "openai"
+  "tools_used": ["lookup_bank_rules"],
+  ...
 }
 ```

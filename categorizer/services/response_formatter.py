@@ -10,7 +10,7 @@ Responsibilities:
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from categorizer.schemas import (
     CategorizationResponse,
@@ -26,6 +26,7 @@ def parse_and_format(
     raw_response: str,
     request: CategorizationRequest,
     client: BaseLLMClient,
+    tools_used: List[str] | None = None,
 ) -> CategorizationResponse:
     """
     Parses raw LLM text → validates → returns CategorizationResponse.
@@ -53,6 +54,7 @@ def parse_and_format(
         reasoning=reasoning,
         model_used=client.model_name,
         provider=client.provider_name,
+        tools_used=list(dict.fromkeys(tools_used or [])),  # deduplicate, preserve order
     )
 
 

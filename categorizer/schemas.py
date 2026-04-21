@@ -69,6 +69,7 @@ class CategorizationResponse(BaseModel):
     reasoning: str
     model_used: str
     provider: str
+    tools_used: List[str] = Field(default_factory=list)  # populated when agentic loop runs
 
     @classmethod
     def confidence_label_from_score(cls, score: float) -> str:

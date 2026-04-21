@@ -254,6 +254,7 @@ class TestCategorizationServiceIntegration(unittest.TestCase):
         mock_client = MagicMock()
         mock_client.model_name = "gpt-4o-mini"
         mock_client.provider_name = "openai"
+        mock_client.supports_tools.return_value = False  # use standard single-turn path
         mock_client.complete.return_value = MOCK_LLM_RESPONSE
         mock_factory.return_value = mock_client
 
@@ -268,6 +269,7 @@ class TestCategorizationServiceIntegration(unittest.TestCase):
     @patch("categorizer.services.categorization_service.LLMClientFactory.get")
     def test_llm_failure_raises_value_error(self, mock_factory):
         mock_client = MagicMock()
+        mock_client.supports_tools.return_value = False
         mock_client.complete.side_effect = Exception("Network timeout")
         mock_factory.return_value = mock_client
 

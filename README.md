@@ -1,6 +1,6 @@
 # Transaction Categorization Service
 
-A backend-only AI-powered service that automatically categorizes financial transactions using an LLM. Built with Django REST Framework, a model-agnostic LLM abstraction layer, and a clean service-layer architecture.
+An AI-powered agent that automatically categorizes financial transactions using an LLM with access to company-specific heuristics. Built with Django REST Framework, an agentic tool-use loop (Anthropic), and a clean service-layer architecture.
 
 ---
 
@@ -12,15 +12,26 @@ categorizer/
 ├── views.py                    # Thin DRF views — no business logic
 ├── urls.py                     # Route definitions
 ├── services/
-│   ├── categorization_service.py   # Orchestrator — pipeline entry point
-│   ├── context_builder.py          # Builds structured LLM prompt
-│   ├── llm_client.py               # Model-agnostic LLM abstraction + factory
-│   └── response_formatter.py       # Parses & validates LLM output
+│   ├── categorization_service.py   # Orchestrator — agentic or standard pipeline
+│   ├── context_builder.py          # Builds system + user prompts (standard or agentic)
+│   ├── llm_client.py               # Model-agnostic LLM abstraction + agentic loop
+│   ├── response_formatter.py       # Parses & validates LLM output
+│   └── tools.py                    # Tool definitions + implementations (NEW)
 └── utils/
     └── exception_handler.py        # Global error envelope
+
+heuristics/                     # Company-specific reference data
+├── c125_BankRules.json             # Keyword → GL account rules for company 125
+├── c125_COA.json                   # Chart of Accounts for company 125
+├── c125_Categorized_Transactions_*.json  # Historical categorized transactions
+├── c125_Plaid_Transactions_*.json        # Raw Plaid bank feed
+├── c417_BankRules.json             # Same for company 417
+├── c417_COA.json
+├── c417_Categorized_Transactions_*.json
+└── c417_Plaid_Transactions_*.json
 ```
 
-**Pipeline flow:**
+**Agentic pipeline flow (Anthropic provider):**
 ```
 POST /api/v1/categorize/
         │
@@ -28,17 +39,40 @@ POST /api/v1/categorize/
   [View] validate input (Pydantic)
         │
         ▼
-  [context_builder] build system + user prompt
+  [context_builder] build agentic system + user prompt
         │
         ▼
-  [llm_client] invoke LLM (provider resolved from config)
+  [AnthropicClient.complete_agentic()] ──────────────────────────────┐
+        │                                                             │
+        │  ┌─ stop_reason == "tool_use" ──► execute tool ────────────┘
+        │  └─ stop_reason == "end_turn" ──► extract text
         │
         ▼
   [response_formatter] extract JSON → validate category → format response
         │
         ▼
-  Deterministic JSON response
+  JSON response (includes tools_used list)
 ```
+
+**Standard pipeline flow (OpenAI / HuggingFace):**
+```
+POST /api/v1/categorize/
+        │
+        ▼
+  [View] → [context_builder] → single LLM call → [response_formatter] → JSON
+```
+
+---
+
+## Available Tools (Agentic Mode)
+
+When using the Anthropic provider, the model has access to three tools:
+
+| Tool | Purpose | When to use |
+|---|---|---|
+| `lookup_bank_rules` | Keyword-match against company-defined GL rules | Always call first — a match is ground truth |
+| `lookup_similar_transactions` | Search historical categorized transactions | When no bank rule matches |
+| `get_chart_of_accounts` | Full GL account list with codes and groups | When more CoA detail is needed |
 
 ---
 
@@ -56,7 +90,7 @@ pip install -r requirements.txt
 ### 2. Configure environment
 
 ```bash
-cp .env
+cp .env.example .env
 # Edit .env — at minimum set LLM_API_KEY
 ```
 
@@ -91,19 +125,19 @@ All configuration is environment-driven — no hardcoded company or model logic.
 
 ### Switching providers
 
+**Anthropic (recommended — enables agentic tool use):**
+```env
+LLM_PROVIDER=anthropic
+LLM_API_KEY=sk-ant-...
+LLM_MODEL=claude-haiku-4-5-20251001
+```
+
 **HuggingFace (OpenAI-compatible TGI endpoint):**
 ```env
 LLM_PROVIDER=huggingface
 LLM_API_KEY=hf_...
 LLM_MODEL=mistralai/Mistral-7B-Instruct-v0.2
 LLM_BASE_URL=https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.2/v1
-```
-
-**Anthropic:**
-```env
-LLM_PROVIDER=anthropic
-LLM_API_KEY=sk-ant-...
-LLM_MODEL=claude-haiku-4-5-20251001
 ```
 
 ---
@@ -125,7 +159,7 @@ Categorize a single transaction.
     "currency": "USD",
     "date": "2024-05-01"
   },
-  "company_id": "acme-corp-001",
+  "company_id": "125",
   "industry": "Technology / SaaS",
   "chart_of_accounts": [
     "Software & Subscriptions",
@@ -139,14 +173,7 @@ Categorize a single transaction.
     "Equipment & Hardware",
     "Miscellaneous"
   ],
-  "historical_transactions": [
-    {
-      "description": "AWS monthly bill",
-      "payee": "Amazon Web Services",
-      "amount": 340.50,
-      "category": "Software & Subscriptions"
-    }
-  ]
+  "historical_transactions": []
 }
 ```
 
@@ -166,9 +193,10 @@ Categorize a single transaction.
       "reasoning": "Catch-all fallback if category is unclear."
     }
   ],
-  "reasoning": "Notion is a SaaS tool; monthly charges from software vendors map directly to Software & Subscriptions.",
-  "model_used": "gpt-4o-mini",
-  "provider": "openai"
+  "reasoning": "No bank rule matched; historical transactions show similar SaaS tools categorized under Software & Subscriptions.",
+  "model_used": "claude-haiku-4-5-20251001",
+  "provider": "anthropic",
+  "tools_used": ["lookup_bank_rules", "lookup_similar_transactions"]
 }
 ```
 
@@ -177,24 +205,20 @@ Categorize a single transaction.
 - `MEDIUM` — score ≥ 0.50
 - `LOW` — score < 0.50
 
-**Error `422 Unprocessable Entity`** (validation failure):
-```json
-{
-  "error": "Invalid request payload.",
-  "detail": [{"loc": ["chart_of_accounts"], "msg": "field required"}],
-  "code": null
-}
-```
+**Error responses:**
+
+| Status | Trigger |
+|---|---|
+| `422` | Pydantic validation failure |
+| `400` | Malformed JSON |
+| `502` | LLM API error |
+| `500` | Unhandled server error |
 
 ---
 
 ### `GET /api/v1/health/`
 
-Liveness probe.
-
-```json
-{"status": "ok"}
-```
+Liveness probe — returns `{"status": "ok"}`.
 
 ---
 
@@ -215,13 +239,6 @@ pip install pytest pytest-django
 pytest tests/ -v
 ```
 
-Tests cover:
-- Schema validation (Pydantic)
-- Context builder output correctness
-- JSON extraction from raw LLM text
-- Response formatter (valid, edge cases, fuzzy category matching)
-- Full pipeline integration (LLM mocked)
-
 ---
 
 ## Evaluation
@@ -230,35 +247,24 @@ Tests cover:
 python evaluate.py
 ```
 
-Runs 5 sample transactions through the live LLM and reports:
-
-- **Top-1 accuracy** — whether predicted category matches expected
-- **Confidence score** distribution (avg, min, max)
-- Per-sample pass/fail with reasoning
-- Saves full results to `evaluation_results.json`
-
-Sample expected outputs:
-
-| # | Description | Expected Category | Expected Confidence |
-|---|---|---|---|
-| 1 | Notion Pro subscription | Software & Subscriptions | ≥ 0.85 |
-| 2 | Team dinner client meeting | Meals & Entertainment | ≥ 0.80 |
-| 3 | Marriott hotel NYC | Travel & Lodging | ≥ 0.85 |
-| 4 | Legal retainer invoice | Professional Services | ≥ 0.80 |
-| 5 | Staples printer ink | Office Supplies | ≥ 0.75 |
+Runs 5 sample transactions through the live LLM and reports top-1 accuracy, confidence distribution, and per-sample results. Saves full results to `evaluation_results.json`.
 
 ---
 
 ## Design Decisions
 
-**LLM abstraction layer** — `BaseLLMClient` defines a minimal interface (`complete(system, user) → str`). Adding a new provider requires subclassing and registering in `LLMClientFactory._REGISTRY` — no other code changes.
+**Agentic tool use** — When using Anthropic, the model drives its own information-gathering before categorizing. It can look up bank rules (explicit bookkeeper preferences), historical transactions (past behavior), and the full Chart of Accounts. This makes the system an actual agent rather than a single-call classifier.
+
+**`stop_reason == "end_turn"` loop termination** — The agentic loop in `AnthropicClient.complete_agentic()` continues executing tool calls as long as `stop_reason == "tool_use"`, and exits when `stop_reason == "end_turn"`. A max-iterations guard (10) prevents runaway loops.
+
+**Tool file caching** — Heuristics files are loaded once per process and cached in memory (`_file_cache`). Avoids re-reading large JSON files on every request.
+
+**Graceful degradation** — Non-Anthropic providers fall back to the standard single-turn pipeline. No code changes required when switching providers.
+
+**`tools_used` in response** — The API response includes a `tools_used` list showing which tools the agent called. Useful for observability, debugging, and understanding confidence.
 
 **Pydantic schemas** — All input/output contracts live in `schemas.py`. Views stay thin; the schema layer handles coercion, validation, and history truncation.
 
-**Prompt construction** — System prompt is stable (instructions + JSON schema). User prompt is variable (company context, CoA, history, transaction). This separation makes prompt iteration easy.
+**No hardcoded company logic** — Company ID, industry, CoA, and history are all runtime inputs. Heuristics files are discovered by convention (`c{id}_BankRules.json`).
 
-**Category validation** — The formatter enforces that the LLM's suggested category exists in the Chart of Accounts. A fuzzy fallback (word overlap) handles minor casing/wording differences before raising an error.
-
-**No hardcoded company logic** — Company ID, industry, CoA, and history are all runtime inputs. The service is fully multi-tenant by design.
-
-**Logging** — Uses Python's `logging` module. Logs model, provider, category, and confidence — never transaction descriptions or payee names that could contain PII.
+**Logging** — Logs model, provider, category, confidence, and tools used — never transaction descriptions or payee names (PII-safe).
