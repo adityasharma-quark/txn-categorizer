@@ -230,6 +230,109 @@ def get_chart_of_accounts(company_id: str) -> str:
     return header + "\n".join(lines)
 
 
+# ─── Rule engine helpers (used by Tier 1 and Tier 2 enrichment) ──────────────
+# These return structured data / formatted strings for the service layer,
+# not for the LLM — they bypass the tool-call protocol entirely.
+
+def get_matching_rules(company_id: str, description: str) -> List[Dict[str, Any]]:
+    """
+    Returns structured list of active bank rules that match the description.
+    Each entry: {title, matched_keyword, account_ids, rule_category_name}
+    Used by the Tier 1 rule engine — not a tool the LLM calls.
+    """
+    cid = _normalize_cid(company_id)
+    path = os.path.join(HEURISTICS_DIR, f"c{cid}_BankRules.json")
+    if not os.path.exists(path):
+        return []
+
+    data = _load_json(path)
+    rules: List[Dict] = data.get("data", {}).get("list", [])
+    desc_lower = description.lower()
+
+    matched = []
+    for rule in rules:
+        if not rule.get("isActive") or rule.get("isDeleted"):
+            continue
+        for field in rule.get("statementMatchesFildes", []):
+            pattern = field.get("fieldText", "").lower()
+            if pattern and pattern in desc_lower:
+                matched.append({
+                    "title": rule["title"],
+                    "matched_keyword": field["fieldText"],
+                    "account_ids": [
+                        item.get("account")
+                        for item in rule.get("ratioLineItems", [])
+                        if item.get("account")
+                    ],
+                    "rule_category_name": rule.get("ruleCategoryName", ""),
+                })
+                break  # one match per rule is enough
+    return matched
+
+
+_RULE_STOP_WORDS = frozenset({
+    "expense", "expenses", "income", "the", "a", "an", "and", "or",
+    "by", "for", "fee", "fees", "monthly", "weekly", "annual", "ms",
+    "business", "company", "corp",
+})
+
+
+def map_rule_to_coa(
+    rule: Dict[str, Any],
+    chart_of_accounts: List[str],
+) -> "tuple[str, float] | None":
+    """
+    Maps a bank rule to the best-matching Chart of Accounts item via word overlap
+    between the rule title and CoA item names.
+    Returns (category, confidence) or None if no meaningful word overlap found.
+    """
+    import re
+
+    title_words = (
+        set(re.split(r"[\s\-_\(\)/,\.]+", rule["title"].lower()))
+        - _RULE_STOP_WORDS
+        - {""}
+    )
+
+    best_cat: "str | None" = None
+    best_score = 0
+
+    for coa_item in chart_of_accounts:
+        coa_words = (
+            set(re.split(r"[\s&\-_]+", coa_item.lower()))
+            - _RULE_STOP_WORDS
+            - {""}
+        )
+        score = len(title_words & coa_words)
+        if score > best_score:
+            best_score = score
+            best_cat = coa_item
+
+    if best_score == 0 or best_cat is None:
+        return None
+
+    confidence = 0.97 if best_score >= 2 else 0.92
+    return (best_cat, confidence)
+
+
+def build_enrichment_context(
+    company_id: str,
+    description: str,
+    payee: str,
+    chart_of_accounts: List[str],
+) -> str:
+    """
+    Pre-fetches bank rule matches and similar historical transactions and returns
+    a formatted string for injection into the Tier 2 enriched LLM prompt.
+    """
+    rules_text = lookup_bank_rules(company_id, description)
+    history_text = lookup_similar_transactions(company_id, description, payee)
+    return (
+        f"### Bank Rules\n{rules_text}\n\n"
+        f"### Similar Historical Transactions\n{history_text}"
+    )
+
+
 # ─── Tool dispatcher ──────────────────────────────────────────────────────────
 
 def execute_tool(name: str, inputs: Dict[str, Any]) -> str:

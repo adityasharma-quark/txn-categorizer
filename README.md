@@ -31,7 +31,7 @@ heuristics/                     # Company-specific reference data
 └── c417_Plaid_Transactions_*.json
 ```
 
-**Agentic pipeline flow (Anthropic provider):**
+**Pipeline flow — three tiers, tried in order:**
 ```
 POST /api/v1/categorize/
         │
@@ -39,40 +39,43 @@ POST /api/v1/categorize/
   [View] validate input (Pydantic)
         │
         ▼
-  [context_builder] build agentic system + user prompt
+  TIER 1 — Rule Engine (zero LLM cost)
+    keyword-match bank rules → word-overlap map to CoA
+    HIT  → return immediately  (conf 0.92–0.97, model_used="rule-engine")
+    MISS ↓
         │
         ▼
-  [AnthropicClient.complete_agentic()] ──────────────────────────────┐
-        │                                                             │
-        │  ┌─ stop_reason == "tool_use" ──► execute tool ────────────┘
-        │  └─ stop_reason == "end_turn" ──► extract text
+  TIER 2 — Enriched Single LLM Call
+    pre-fetch: lookup_bank_rules + lookup_similar_transactions
+    inject as context → single client.complete() call
+    confidence >= 0.5 → return  (categorization_tier=2)
+    confidence <  0.5 ↓
         │
         ▼
-  [response_formatter] extract JSON → validate category → format response
-        │
-        ▼
-  JSON response (includes tools_used list)
-```
-
-**Standard pipeline flow (OpenAI / HuggingFace):**
-```
-POST /api/v1/categorize/
-        │
-        ▼
-  [View] → [context_builder] → single LLM call → [response_formatter] → JSON
+  TIER 3 — Agentic Escalation  (Anthropic only)
+    [AnthropicClient.complete_agentic()] loop ─────────────────────────┐
+      stop_reason == "tool_use"  → execute tool → append result ───────┘
+      stop_reason == "end_turn"  → extract text → return
+    (categorization_tier=3, tools_used=[...])
 ```
 
 ---
 
-## Available Tools (Agentic Mode)
+## Tier Routing Summary
 
-When using the Anthropic provider, the model has access to three tools:
+| Tier | Trigger | LLM calls | `categorization_tier` |
+|---|---|---|---|
+| 1 — Rule Engine | Bank rule keyword match + CoA word-overlap | **0** | `1` |
+| 2 — Enriched LLM | No rule hit, or rule can't map to CoA | **1** | `2` |
+| 3 — Agentic | Tier 2 confidence < 0.5 (Anthropic only) | **2–4** | `3` |
 
-| Tool | Purpose | When to use |
-|---|---|---|
-| `lookup_bank_rules` | Keyword-match against company-defined GL rules | Always call first — a match is ground truth |
-| `lookup_similar_transactions` | Search historical categorized transactions | When no bank rule matches |
-| `get_chart_of_accounts` | Full GL account list with codes and groups | When more CoA detail is needed |
+## Available Tools (Tier 3 Agentic Mode)
+
+| Tool | Purpose |
+|---|---|
+| `lookup_bank_rules` | Keyword-match against company-defined GL rules |
+| `lookup_similar_transactions` | Search historical categorized transactions |
+| `get_chart_of_accounts` | Full GL account list with codes and groups |
 
 ---
 
@@ -159,7 +162,7 @@ Categorize a single transaction.
     "currency": "USD",
     "date": "2024-05-01"
   },
-  "company_id": "125",
+  "company_id": "acme-corp-001",
   "industry": "Technology / SaaS",
   "chart_of_accounts": [
     "Software & Subscriptions",
@@ -253,18 +256,20 @@ Runs 5 sample transactions through the live LLM and reports top-1 accuracy, conf
 
 ## Design Decisions
 
-**Agentic tool use** — When using Anthropic, the model drives its own information-gathering before categorizing. It can look up bank rules (explicit bookkeeper preferences), historical transactions (past behavior), and the full Chart of Accounts. This makes the system an actual agent rather than a single-call classifier.
+**Tiered pipeline** — Tier 1 (rule engine) covers the majority of known vendors at zero LLM cost. Tier 2 (enriched single call) handles everything else with pre-fetched context in the prompt. Tier 3 (agentic) is reserved exclusively for genuinely ambiguous transactions (confidence < 0.5) where the LLM needs to explore further. This keeps cost and latency low on the hot path.
 
-**`stop_reason == "end_turn"` loop termination** — The agentic loop in `AnthropicClient.complete_agentic()` continues executing tool calls as long as `stop_reason == "tool_use"`, and exits when `stop_reason == "end_turn"`. A max-iterations guard (10) prevents runaway loops.
+**`stop_reason == "end_turn"` loop termination** — The Tier 3 agentic loop in `AnthropicClient.complete_agentic()` continues executing tool calls as long as `stop_reason == "tool_use"`, exits on `stop_reason == "end_turn"`. A 10-iteration safety cap prevents runaway loops.
 
-**Tool file caching** — Heuristics files are loaded once per process and cached in memory (`_file_cache`). Avoids re-reading large JSON files on every request.
+**Rule engine word-overlap mapping** — `map_rule_to_coa()` maps bank rule titles to the request's CoA items via word overlap after stop-word removal. Confidence is 0.97 for ≥ 2 word matches, 0.92 for 1. Zero overlap falls through to Tier 2.
 
-**Graceful degradation** — Non-Anthropic providers fall back to the standard single-turn pipeline. No code changes required when switching providers.
+**Tool file caching** — Heuristics files are loaded once per process (`_file_cache`). Avoids re-reading large JSON files on every request.
 
-**`tools_used` in response** — The API response includes a `tools_used` list showing which tools the agent called. Useful for observability, debugging, and understanding confidence.
+**`categorization_tier` in response** — Every response includes which tier produced it (1, 2, or 3). Combined with `tools_used`, this makes the decision path fully observable.
 
-**Pydantic schemas** — All input/output contracts live in `schemas.py`. Views stay thin; the schema layer handles coercion, validation, and history truncation.
+**Graceful degradation** — Non-Anthropic providers skip Tier 3 silently; they run Tier 1 + Tier 2 and return the Tier 2 result even if confidence is low.
+
+**Pydantic schemas** — All I/O contracts live in `schemas.py`. Views stay thin.
 
 **No hardcoded company logic** — Company ID, industry, CoA, and history are all runtime inputs. Heuristics files are discovered by convention (`c{id}_BankRules.json`).
 
-**Logging** — Logs model, provider, category, confidence, and tools used — never transaction descriptions or payee names (PII-safe).
+**Logging** — Logs tier, model, provider, category, confidence, and tool names — never transaction descriptions or payee names (PII-safe).

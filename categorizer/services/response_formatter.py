@@ -27,6 +27,7 @@ def parse_and_format(
     request: CategorizationRequest,
     client: BaseLLMClient,
     tools_used: List[str] | None = None,
+    tier: int = 2,
 ) -> CategorizationResponse:
     """
     Parses raw LLM text → validates → returns CategorizationResponse.
@@ -55,6 +56,7 @@ def parse_and_format(
         model_used=client.model_name,
         provider=client.provider_name,
         tools_used=list(dict.fromkeys(tools_used or [])),  # deduplicate, preserve order
+        categorization_tier=tier,
     )
 
 

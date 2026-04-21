@@ -92,23 +92,47 @@ _USER_TEMPLATE = """\
 Classify this transaction. Return ONLY the JSON object.
 """
 
+_USER_TEMPLATE_ENRICHED = """\
+## Company Context
+- Company ID : {company_id}
+- Industry   : {industry}
+
+## Chart of Accounts (valid categories)
+{chart_of_accounts}
+
+## Historical Examples (few-shot)
+{historical_block}
+
+## Heuristic Context (retrieved from company data — use as strong evidence)
+{enrichment_context}
+
+## Transaction to Categorize
+- Description : {description}
+- Payee/Vendor: {payee}
+- Amount      : {amount}
+
+Classify this transaction. Return ONLY the JSON object.
+"""
+
 
 def build_prompts(
-    request: CategorizationRequest, agentic: bool = False
+    request: CategorizationRequest,
+    agentic: bool = False,
+    enrichment_context: str = "",
 ) -> tuple[str, str]:
     """
     Returns (system_prompt, user_prompt).
-    Pass agentic=True to use the tool-aware system prompt.
+    - agentic=True      → tool-aware system prompt (Tier 3)
+    - enrichment_context → pre-fetched heuristics injected into user prompt (Tier 2)
     """
     system_prompt = _AGENTIC_SYSTEM_TEMPLATE if agentic else _SYSTEM_TEMPLATE
 
     chart_block = "\n".join(
         f"  - {account}" for account in request.chart_of_accounts
     )
-
     historical_block = _format_history(request.historical_transactions)
 
-    user_prompt = _USER_TEMPLATE.format(
+    common = dict(
         company_id=request.company_id,
         industry=request.industry,
         chart_of_accounts=chart_block,
@@ -121,6 +145,13 @@ def build_prompts(
             else "N/A"
         ),
     )
+
+    if enrichment_context:
+        user_prompt = _USER_TEMPLATE_ENRICHED.format(
+            **common, enrichment_context=enrichment_context
+        )
+    else:
+        user_prompt = _USER_TEMPLATE.format(**common)
 
     return system_prompt, user_prompt
 

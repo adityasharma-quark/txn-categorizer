@@ -49,11 +49,11 @@ txn_categorizer/
 │   │
 │   ├── services/                     # Business logic layer
 │   │   ├── __init__.py
-│   │   ├── categorization_service.py # Orchestrator — agentic or standard pipeline
-│   │   ├── context_builder.py        # Prompt construction (standard + agentic variants)
-│   │   ├── llm_client.py             # LLM abstraction + agentic loop (AnthropicClient)
+│   │   ├── categorization_service.py # Orchestrator — 3-tier pipeline
+│   │   ├── context_builder.py        # Prompt construction (standard + enriched + agentic)
+│   │   ├── llm_client.py             # LLM abstraction + Tier 3 agentic loop
 │   │   ├── response_formatter.py     # JSON parsing & validation
-│   │   └── tools.py                  # Tool definitions + implementations (NEW)
+│   │   └── tools.py                  # LLM tool definitions + rule engine helpers
 │   │
 │   └── utils/                        # Utility functions
 │       ├── __init__.py
@@ -85,7 +85,7 @@ txn_categorizer/
 
 ### Layer 1 — HTTP / Routing
 - **Files**: `core/urls.py`, `categorizer/urls.py`
-- Root URL (`core/urls.py`) forwards all `/api/v1/` traffic to `categorizer/urls.py`.
+- Root URL forwards all `/api/v1/` traffic to `categorizer/urls.py`.
 
 ### Layer 2 — Views (Thin Controllers)
 - **File**: `categorizer/views.py`
@@ -101,7 +101,7 @@ txn_categorizer/
 | `HistoricalTransaction` | A labeled past transaction for few-shot prompting |
 | `CategorizationRequest` | Inbound API request body — auto-caps history at 20 records |
 | `CategorySuggestion` | An alternative category with confidence score and reasoning |
-| `CategorizationResponse` | Complete outbound response including `tools_used` list |
+| `CategorizationResponse` | Outbound response — includes `tools_used` and `categorization_tier` |
 | `ErrorResponse` | Consistent error envelope |
 
 **Confidence thresholds**: HIGH ≥ 0.80, MEDIUM ≥ 0.50, LOW < 0.50
@@ -109,55 +109,86 @@ txn_categorizer/
 ### Layer 4 — Services (Business Logic)
 
 #### `categorization_service.py` (Orchestrator)
-- Function: `categorize_transaction(request) → CategorizationResponse`
-- Checks `client.supports_tools()` to select the agentic or standard pipeline.
-- **Agentic path**: builds agentic prompt → calls `complete_agentic()` → tools loop runs → parse output
-- **Standard path**: builds standard prompt → calls `complete()` → parse output
+Entry point: `categorize_transaction(request) → CategorizationResponse`
+
+Implements a **3-tier pipeline** tried in order:
+
+| Tier | Trigger | LLM calls | `model_used` |
+|---|---|---|---|
+| **1 — Rule Engine** | Bank rule keyword hit + CoA word-overlap mapping succeeds | 0 | `"rule-engine"` |
+| **2 — Enriched LLM** | No Tier 1 hit, or rule can't map to CoA | 1 | provider model |
+| **3 — Agentic** | Tier 2 confidence < 0.5 AND `client.supports_tools()` | 2–4 | provider model |
+
+Internal helpers:
+- `_try_tier1(request, client)` — calls `get_matching_rules()` then `map_rule_to_coa()`; returns a fully-formed `CategorizationResponse` or `None`
 
 #### `context_builder.py` (Prompt Construction)
-- Function: `build_prompts(request, agentic=False) → (system_prompt, user_prompt)`
-- `agentic=True` returns `_AGENTIC_SYSTEM_TEMPLATE` which instructs the model to use tools before deciding.
-- `agentic=False` returns the original `_SYSTEM_TEMPLATE` for single-turn classification.
+Function: `build_prompts(request, agentic=False, enrichment_context="") → (system_prompt, user_prompt)`
+
+Three prompt variants, selected by parameters:
+
+| Condition | System template | User template |
+|---|---|---|
+| `agentic=False`, no enrichment | `_SYSTEM_TEMPLATE` | `_USER_TEMPLATE` |
+| `agentic=False`, enrichment provided | `_SYSTEM_TEMPLATE` | `_USER_TEMPLATE_ENRICHED` (adds `## Heuristic Context` section) |
+| `agentic=True` | `_AGENTIC_SYSTEM_TEMPLATE` | `_USER_TEMPLATE_ENRICHED` |
 
 #### `llm_client.py` (LLM Abstraction)
 - `BaseLLMClient` — abstract base with `complete()`, `supports_tools()`, and `complete_agentic()`
 - **Implementations**:
-  - `OpenAIClient` — single-turn; `supports_tools()` returns False
+  - `OpenAIClient` — single-turn; `supports_tools()` → `False`
   - `HuggingFaceClient` — extends `OpenAIClient` for HF-compatible endpoints
-  - `AnthropicClient` — implements the full agentic loop; `supports_tools()` returns True
+  - `AnthropicClient` — `supports_tools()` → `True`; implements Tier 3 agentic loop
 - `LLMClientFactory` — resolves and instantiates the correct client from `LLM_PROVIDER`
 
-**`AnthropicClient.complete_agentic()` loop logic:**
+**`AnthropicClient.complete_agentic()` loop (Tier 3 only):**
 ```
 messages = [user_prompt]
-for iteration in range(10):          # max 10 iterations
-    response = messages.create(...)
-    if stop_reason == "end_turn":    # ← model is done
-        return text content
-    if stop_reason == "tool_use":    # ← model wants tool results
-        execute tools → append results → continue
+for iteration in range(10):           # safety cap
+    response = client.messages.create(...)
+    if stop_reason == "end_turn":     # model finished → extract text, return
+        return text
+    if stop_reason == "tool_use":     # model wants data → execute tools, continue
+        execute each tool_use block → append results as user turn
     else:
-        return text content          # unexpected stop, exit gracefully
+        return text                   # unexpected stop (e.g. max_tokens)
 ```
 
-#### `tools.py` (Tool Definitions + Implementations) — NEW
-- **Tool definitions** (Anthropic API format) in `TOOL_DEFINITIONS`
-- **Tool implementations**:
+#### `tools.py` (Tool Definitions + Heuristics Helpers)
 
-| Function | File(s) read | Purpose |
+**LLM-callable tools** — used by Tier 3 agentic loop:
+
+| Function | Reads | Purpose |
 |---|---|---|
-| `lookup_bank_rules(company_id, description)` | `c{id}_BankRules.json` | Keyword-match active rules; resolves account IDs to names via COA |
-| `lookup_similar_transactions(company_id, description, payee)` | `c{id}_Categorized_Transactions*.json` | Word-overlap search; returns up to 5 past transactions with their categories |
-| `get_chart_of_accounts(company_id)` | `c{id}_COA.json` | Full GL account list grouped by ASSETS / LIABILITIES / EQUITY / INCOME / EXPENSES / COGS |
-| `execute_tool(name, inputs)` | — | Dispatcher; called by the agentic loop |
+| `lookup_bank_rules(company_id, description)` | `c{id}_BankRules.json` | Keyword-match active rules; returns formatted text for the LLM |
+| `lookup_similar_transactions(company_id, description, payee)` | `c{id}_Categorized_Transactions*.json` | Word-overlap search; up to 5 past transactions with categories |
+| `get_chart_of_accounts(company_id)` | `c{id}_COA.json` | Full GL account list grouped by account group |
+| `execute_tool(name, inputs)` | — | Dispatcher called by the agentic loop |
 
-- **File caching**: `_file_cache` dict at module level — each heuristics file is loaded once per process.
-- **Company ID normalization**: `_normalize_cid()` handles `"125"`, `"c125"`, `"C125"` → `"125"`.
+**Service-layer helpers** — used directly by `categorization_service.py` (not by the LLM):
+
+| Function | Purpose |
+|---|---|
+| `get_matching_rules(company_id, description)` | Returns structured rule matches as `List[Dict]` for Tier 1 rule engine |
+| `map_rule_to_coa(rule, chart_of_accounts)` | Word-overlap maps a rule title to the closest CoA item; returns `(category, confidence)` or `None` |
+| `build_enrichment_context(company_id, description, payee, chart_of_accounts)` | Pre-fetches rules + history; returns formatted string injected into the Tier 2 prompt |
+
+**Confidence from word-overlap mapping:**
+- ≥ 2 matching words between rule title and CoA item → confidence **0.97**
+- 1 matching word → confidence **0.92**
+- 0 matching words → `None` (Tier 1 miss, fall through to Tier 2)
+
+**Shared internals:**
+- `_file_cache: Dict` — module-level cache; each heuristics file loaded once per process
+- `_normalize_cid()` — normalises `"c125"`, `"C125"`, `"125"` → `"125"`
+- `_build_account_map(cid)` — builds `{account_id (int): display_name}` from COA file
 
 #### `response_formatter.py` (Parse & Validate)
-- Function: `parse_and_format(raw_response, request, client, tools_used=None) → CategorizationResponse`
-- Extracts JSON, validates category (exact + fuzzy), clamps confidence, deduplicates alternatives.
-- Passes `tools_used` into the response object.
+Function: `parse_and_format(raw_response, request, client, tools_used=None, tier=2) → CategorizationResponse`
+- Extracts JSON from raw LLM text (handles markdown fences, prose wrapping)
+- Validates suggested category against CoA (exact match, then fuzzy word-overlap fallback)
+- Clamps confidence scores to `[0.0, 1.0]`
+- Deduplicates alternatives; passes `tools_used` and `tier` into the response
 
 ### Layer 5 — Utilities
 - `categorizer/utils/exception_handler.py` — global DRF exception handler
@@ -172,7 +203,7 @@ for iteration in range(10):          # max 10 iterations
 
 | Method | Route | Purpose |
 |---|---|---|
-| `POST` | `/api/v1/categorize/` | Categorize a transaction (agentic or standard) |
+| `POST` | `/api/v1/categorize/` | Categorize a transaction via the 3-tier pipeline |
 | `GET` | `/api/v1/health/` | Liveness probe |
 | `GET` | `/api/v1/samples/` | Return 5 mock sample requests |
 
@@ -205,11 +236,17 @@ for iteration in range(10):          # max 10 iterations
   "confidence_label": "HIGH",
   "alternative_categories": [...],
   "reasoning": "string",
-  "model_used": "claude-haiku-4-5-20251001",
-  "provider": "anthropic",
-  "tools_used": ["lookup_bank_rules", "lookup_similar_transactions"]
+  "model_used": "rule-engine | gpt-4o-mini | claude-haiku-4-5-20251001 | ...",
+  "provider": "heuristics | openai | anthropic | huggingface",
+  "tools_used": [],
+  "categorization_tier": 1
 }
 ```
+
+`categorization_tier` values:
+- `1` — answered by the rule engine (no LLM call)
+- `2` — answered by a single enriched LLM call
+- `3` — answered after agentic escalation (Anthropic only)
 
 **Error Responses:**
 
@@ -247,7 +284,7 @@ for iteration in range(10):          # max 10 iterations
 | `openai >=1.30` | OpenAI API client |
 | `pydantic >=2.0` | Schema validation & type coercion |
 | `python-dotenv >=1.0` | Load `.env` into environment |
-| `anthropic >=0.25` (optional) | Anthropic API client — required for agentic tool use |
+| `anthropic >=0.25` (optional) | Anthropic API client — required for Tier 3 agentic escalation |
 | `pytest >=8.0` (optional) | Test framework |
 | `pytest-django >=4.8` (optional) | Django-pytest integration |
 
@@ -276,7 +313,7 @@ for iteration in range(10):          # max 10 iterations
 | `TestContextBuilder` | Prompt building, CoA embedding, few-shot formatting |
 | `TestExtractJsonBlock` | JSON extraction from fenced / prose-wrapped LLM output |
 | `TestResponseFormatter` | JSON parsing, category validation, confidence clamping |
-| `TestCategorizationServiceIntegration` | End-to-end pipeline (LLM mocked), failure handling |
+| `TestCategorizationServiceIntegration` | End-to-end pipeline (LLM mocked with `supports_tools=False`), failure handling |
 
 ### Middleware (`core/settings.py`)
 - `SecurityMiddleware` — HTTPS/security headers
@@ -287,48 +324,70 @@ for iteration in range(10):          # max 10 iterations
 | File | Function | Purpose |
 |---|---|---|
 | `llm_client.py` | `extract_json_block(raw)` | Parse JSON from LLM text (fences, prose) |
-| `response_formatter.py` | `_validate_category()` | Case-insensitive CoA matching + fuzzy fallback |
-| `response_formatter.py` | `_fuzzy_match()` | Word-overlap matching |
-| `response_formatter.py` | `_clamp()` | Clamp confidence to `[0.0, 1.0]` |
-| `tools.py` | `_build_account_map()` | Build account-id → name dict from COA file |
-| `tools.py` | `_normalize_cid()` | Normalize company ID format |
+| `response_formatter.py` | `_validate_category()` | Case-insensitive CoA match + fuzzy word-overlap fallback |
+| `response_formatter.py` | `_fuzzy_match()` | Word-overlap matching for category names |
+| `response_formatter.py` | `_clamp()` | Clamp float to `[0.0, 1.0]` |
+| `tools.py` | `get_matching_rules()` | Structured rule lookup for Tier 1 rule engine |
+| `tools.py` | `map_rule_to_coa()` | Word-overlap rule title → CoA item mapping |
+| `tools.py` | `build_enrichment_context()` | Pre-fetch heuristics for Tier 2 prompt injection |
+| `tools.py` | `_build_account_map()` | Build `{account_id → name}` dict from COA file |
+| `tools.py` | `_normalize_cid()` | Normalise company ID format |
 
 ---
 
 ## 8. Design Patterns & Key Decisions
 
-### 1. True Agentic Loop (NEW)
-`AnthropicClient` implements a real agentic loop. The model decides which tools to call, in what order, based on the transaction and company context. The loop exits only when `stop_reason == "end_turn"`. This is not a pre-scripted flow — the model's tool-calling behavior is emergent.
+### 1. 3-Tier Hybrid Pipeline
+The pipeline is optimised for cost and latency: cheap tiers are tried first and the expensive agentic tier is only reached when cheaper tiers cannot produce a confident answer.
 
-### 2. Graceful Degradation
-`BaseLLMClient.supports_tools()` defaults to `False`. Non-Anthropic providers get the original single-turn pipeline transparently. The categorization service branches on this flag — no other code changes needed when switching providers.
+- **Tier 1** (rule engine, 0 LLM calls) handles known vendors fast and deterministically.
+- **Tier 2** (1 LLM call) handles the majority of remaining transactions with enriched context.
+- **Tier 3** (2–4 LLM calls) is reserved for genuinely ambiguous transactions where the model needs to explore, and is only available with Anthropic.
 
-### 3. Heuristics as Ground Truth
-The `lookup_bank_rules` tool encodes an explicit signal: if a rule matches, it represents a human bookkeeper's deliberate choice and should be treated as high-confidence ground truth. The agentic system prompt instructs the model to respect this.
+### 2. Rule Engine Word-Overlap Mapping
+`map_rule_to_coa()` maps a bank rule's title to the request's Chart of Accounts by computing word overlap after stop-word removal. Confidence is set to 0.97 for ≥ 2 overlapping words and 0.92 for 1. Zero overlap falls through to Tier 2 (the rule matched the description, but the category is unclear from the title alone — let the LLM decide with the rule text as context).
 
-### 4. Tool File Caching
-`_file_cache` in `tools.py` is a module-level dict. Each heuristics file is read from disk once per process. Avoids re-reading large files (e.g. 1,243-transaction history) on every request.
+### 3. Tier 2 Prompt Enrichment
+Rather than calling tools at LLM cost during Tier 2, the service pre-fetches bank rule matches and historical transactions in Python and injects them into `_USER_TEMPLATE_ENRICHED`. The LLM gets the same signal it would get from tools but in a single round-trip.
 
-### 5. `tools_used` Observability
-Every API response includes `tools_used`, a deduplicated list of tools the agent called. This enables debugging, latency attribution, and confidence analysis (e.g. HIGH confidence with `lookup_bank_rules` means a rule matched).
+### 4. Agentic Escalation (Tier 3)
+Only fires when Tier 2 confidence < 0.5. The model can then call tools in any order it chooses and iterate until `stop_reason == "end_turn"`. A 10-iteration cap prevents runaway loops. Non-Anthropic providers skip Tier 3 and return the Tier 2 result.
 
-### 6. Prompt Separation
-- `_SYSTEM_TEMPLATE` — original single-turn instructions
-- `_AGENTIC_SYSTEM_TEMPLATE` — tool-aware instructions with explicit decision strategy
-Both share the same JSON output schema. The `build_prompts(agentic=True/False)` flag selects the right template.
+### 5. Heuristics as Ground Truth
+Bank rules represent explicit decisions by a company's bookkeepers. When a rule matches, the system treats it as ground truth regardless of what the LLM might think. The Tier 3 agentic system prompt instructs the model to assign HIGH confidence (≥ 0.90) to rule matches. Tier 1 encodes this even more strictly — it returns a deterministic answer without consulting the LLM at all.
 
-### 7. Category Validation with Fuzzy Fallback
+### 6. Tool File Caching
+`_file_cache` in `tools.py` is a module-level dict. Each heuristics file is loaded from disk once per process. This matters for the large categorized transactions file (1,243 transactions).
+
+### 7. `categorization_tier` + `tools_used` Observability
+Every response includes `categorization_tier` (1/2/3) and `tools_used` (deduplicated list). Together they make the decision path fully observable:
+- Tier 1, no tools → rule engine answered
+- Tier 2, no tools → enriched LLM answered
+- Tier 3, tools listed → agentic escalation answered; tools show what the model explored
+
+### 8. Prompt Separation
+Three distinct prompt templates in `context_builder.py`:
+- `_SYSTEM_TEMPLATE` — vanilla single-turn instructions
+- `_AGENTIC_SYSTEM_TEMPLATE` — tool-aware instructions with explicit decision strategy for Tier 3
+- `_USER_TEMPLATE_ENRICHED` — extends the user prompt with a `## Heuristic Context` section for Tiers 2 and 3
+
+All share the same JSON output schema, so `response_formatter.py` is unchanged.
+
+### 9. Graceful Degradation
+`BaseLLMClient.supports_tools()` defaults to `False`. If an OpenAI or HuggingFace provider is configured, the pipeline runs Tier 1 + Tier 2 and returns the Tier 2 result even when confidence is low — Tier 3 is silently skipped.
+
+### 10. Category Validation with Fuzzy Fallback
 1. Exact match (case-insensitive)
 2. Word-overlap fuzzy match
-3. Raises ValueError if neither matches
+3. Raises `ValueError` if neither matches
 
-Prevents silent category mismatches where the LLM or a tool returns a slightly different account name.
+Prevents silent mismatches where the LLM returns a slightly different account name.
 
-### 8. Multi-Tenant by Design
-Company ID, industry, CoA, and history are all runtime inputs. Heuristics files are discovered by convention (`c{id}_BankRules.json`). No hardcoded company logic anywhere.
+### 11. Multi-Tenant by Design
+Company ID, industry, CoA, and history are all runtime inputs. Heuristics files are discovered by naming convention (`c{id}_BankRules.json`). No hardcoded company logic anywhere.
 
-### 9. PII-Safe Logging
-Logs model, provider, category, confidence, and tool names — never transaction descriptions or payee names.
+### 12. PII-Safe Logging
+Logs tier, model, provider, category, confidence, and tool names — never transaction descriptions or payee names.
 
 ---
 
@@ -353,12 +412,14 @@ Equipment & Hardware, Miscellaneous
 
 | Company | Bank Rules | COA Accounts | Historical Transactions |
 |---|---|---|---|
-| c125 | ~10 rules | 280 accounts | 1,243 categorized |
-| c417 | ~35 rules | — | — |
+| c125 | ~10 rules | 20 loaded (280 total, paginated) | 1,243 categorized |
+| c417 | ~35 rules | 20 loaded (paginated) | available |
+
+> **Note:** The COA JSON files contain only page 0 (20 accounts). Bank rule account IDs that fall outside this page resolve to `Account#N` in tool output, but rule titles still provide sufficient category signal to the model.
 
 ### Evaluation Script (`evaluate.py`)
-- Runs all 5 samples through the live LLM (requires `.env` configured)
-- Reports: top-1 accuracy, confidence distribution, per-sample results
+- Runs all 5 samples through the live pipeline (requires `.env` configured)
+- Reports: top-1 accuracy, confidence distribution, per-sample tier and reasoning
 - Saves results to `evaluation_results.json`
 - Exit code: `0` if accuracy ≥ 60%
 
@@ -379,40 +440,53 @@ POST /api/v1/categorize/  (JSON body)
   │
   ├─ client = LLMClientFactory.get()
   │
-  ├─ IF client.supports_tools() == True (AnthropicClient):
-  │   ├─ build_prompts(request, agentic=True)
-  │   └─ client.complete_agentic(system, user, TOOL_DEFINITIONS, execute_tool)
-  │       │
-  │       ├─ [iteration 1] stop_reason="tool_use"
-  │       │   ├─ execute lookup_bank_rules(company_id, description)
-  │       │   └─ append tool result → continue
-  │       │
-  │       ├─ [iteration 2] stop_reason="tool_use"
-  │       │   ├─ execute lookup_similar_transactions(company_id, description)
-  │       │   └─ append tool result → continue
-  │       │
-  │       └─ [iteration 3] stop_reason="end_turn"  ← exit loop, return text
+  ├─━━ TIER 1: Rule Engine ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  │    get_matching_rules(company_id, description)   ← tools.py
+  │      └─ load c{id}_BankRules.json, keyword-match active rules
+  │    map_rule_to_coa(rule, chart_of_accounts)      ← tools.py
+  │      └─ word-overlap between rule title and CoA items
+  │    HIT  → return CategorizationResponse(tier=1, model_used="rule-engine")
+  │    MISS ↓
   │
-  └─ IF client.supports_tools() == False (OpenAI / HuggingFace):
-      ├─ build_prompts(request, agentic=False)
-      └─ client.complete(system, user) → raw_text
+  ├─━━ TIER 2: Enriched Single LLM Call ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  │    build_enrichment_context(company_id, description, payee, CoA)
+  │      ├─ lookup_bank_rules(...)       → formatted rule matches (or "no rules")
+  │      └─ lookup_similar_transactions(...) → formatted history (or "no history")
+  │    build_prompts(request, agentic=False, enrichment_context=...)
+  │      └─ _USER_TEMPLATE_ENRICHED: injects "## Heuristic Context" section
+  │    client.complete(system_prompt, user_prompt)   ← one LLM call
+  │    parse_and_format(raw, request, client, tier=2)
+  │    confidence >= 0.5 → return CategorizationResponse(tier=2)
+  │    confidence <  0.5 ↓
+  │
+  └─━━ TIER 3: Agentic Escalation (Anthropic only) ━━━━━━━━━━━━━━━━━━━━━━━━━━━
+       client.supports_tools() == False → return Tier 2 result as-is
+       client.supports_tools() == True  ↓
+       build_prompts(request, agentic=True, enrichment_context=...)
+       client.complete_agentic(system, user, TOOL_DEFINITIONS, execute_tool)
          │
-         ▼
-[parse_and_format(raw_text, request, client, tools_used)]
-  ├─ extract_json_block(raw_text)
-  ├─ _validate_category(cat, chart_of_accounts)
-  │   └─ Fuzzy fallback if not exact match
-  ├─ _clamp(confidence) → [0.0, 1.0]
-  ├─ _parse_alternatives(...)
-  └─ Return CategorizationResponse(tools_used=[...])
+         ├─ [iter 1] stop_reason="tool_use"
+         │   model calls lookup_bank_rules(company_id, description)
+         │   → execute → append tool_result → continue
+         │
+         ├─ [iter 2] stop_reason="tool_use"
+         │   model calls lookup_similar_transactions(company_id, description)
+         │   → execute → append tool_result → continue
+         │
+         └─ [iter 3] stop_reason="end_turn"   ← exit loop
+       parse_and_format(raw, request, client, tools_used=[...], tier=3)
+       return CategorizationResponse(tier=3, tools_used=[...])
          │
          ▼
 HTTP 200 JSON
 {
-  "suggested_category": "...",
-  "confidence_score": 0.95,
+  "suggested_category": "Meals & Entertainment",
+  "confidence_score": 0.92,
   "confidence_label": "HIGH",
-  "tools_used": ["lookup_bank_rules"],
-  ...
+  "reasoning": "Bank rule 'Uber Eats - Meals' matched keyword 'Uber Eats'.",
+  "model_used": "rule-engine",
+  "provider": "heuristics",
+  "tools_used": [],
+  "categorization_tier": 1
 }
 ```
